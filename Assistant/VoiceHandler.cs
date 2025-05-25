@@ -1,8 +1,11 @@
+using System;
 using System.Diagnostics;
 #pragma warning disable OPENAI002
 using OpenAI.RealtimeConversation;
 #pragma warning restore OPENAI002
 using Microsoft.Extensions.Logging;
+using System.IO;
+using System.Threading.Tasks;
 
 namespace semanticKernelSample1.Assistant
 {
@@ -13,13 +16,18 @@ namespace semanticKernelSample1.Assistant
     {
         private readonly ILogger _logger;
         private const string TEMP_AUDIO_FOLDER = "temp_audio";
-        
-        public VoiceHandler(ILogger logger)
+        private readonly string _processId;
+        private readonly AudioConfig _audioConfig;
+
+        public VoiceHandler(ILogger logger, AudioConfig audioConfig = null)
         {
-            _logger = logger;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _processId = Process.GetCurrentProcess().Id.ToString();
+            _audioConfig = audioConfig ?? new AudioConfig();
             CreateAudioTempFolder();
+            CleanupTempFiles();
         }
-        
+
         /// <summary>
         /// Creates a temporary folder for audio files if it doesn't exist
         /// </summary>
@@ -39,68 +47,74 @@ namespace semanticKernelSample1.Assistant
                 // Continue without temp folder - will use current directory as fallback
             }
         }
-        
+
         /// <summary>
         /// Records audio from the user's microphone using sox
         /// </summary>
-        /// <returns>Path to the recorded audio file</returns>        
-        public async Task<string> RecordAudioAsync()
+        /// <returns>Path to the recorded audio file</returns>
+        public async Task<string> RecordAudioAsync(int maxRetries = 3)
         {
             var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
-            var inputFileName = $"input_{timestamp}.wav";
+            var inputFileName = $"input_{_processId}_{timestamp}.wav";
             var inputAudioPath = Path.Combine(TEMP_AUDIO_FOLDER, inputFileName);
-            
-            try
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                // Ensure the temp folder exists
-                if (!Directory.Exists(TEMP_AUDIO_FOLDER))
+                try
                 {
-                    CreateAudioTempFolder();
+                    // Ensure the temp folder exists
+                    if (!Directory.Exists(TEMP_AUDIO_FOLDER))
+                    {
+                        CreateAudioTempFolder();
+                    }
+
+                    _logger.LogInformation("Starting audio recording attempt {Attempt}/{MaxRetries}", attempt, maxRetries);
+                    var soxProcess = new Process
+                    {
+                        StartInfo = new ProcessStartInfo
+                        {
+                            FileName = "sox",
+                            Arguments = $"-d {inputAudioPath}",
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Directory.GetCurrentDirectory()
+                        }
+                    };
+
+                    try
+                    {
+                        soxProcess.Start();
+
+                        Console.WriteLine("Recording... Press Enter to stop.");
+                        Console.ReadLine();
+
+                        soxProcess.Kill();
+                        await soxProcess.WaitForExitAsync();
+
+                        _logger.LogInformation("Audio recorded successfully to {Path}", inputAudioPath);
+                        return inputAudioPath;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error recording audio with sox");
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"Error recording audio: {ex.Message}");
+                        Console.ResetColor();
+                        throw;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Recording failed on attempt {Attempt}/{MaxRetries}", attempt, maxRetries);
+                    if (attempt == maxRetries) throw;
+                    await Task.Delay(500 * attempt);
                 }
             }
-            catch
-            {
-                // If temp folder creation fails, fall back to working directory
-                inputAudioPath = inputFileName;
-                _logger.LogWarning("Using working directory for audio files as fallback");
-            }
-            
-            var soxProcess = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "sox",
-                    Arguments = $"-d {inputAudioPath}",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Directory.GetCurrentDirectory()
-                }
-            };
-            
-            try
-            {
-                soxProcess.Start();
-                
-                Console.WriteLine("Recording... Press Enter to stop.");
-                Console.ReadLine();
-                
-                soxProcess.Kill();
-                await soxProcess.WaitForExitAsync();
-                
-                return inputAudioPath;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error recording audio with sox");
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Error recording audio: {ex.Message}");
-                Console.ResetColor();
-                throw;
-            }
+            throw new InvalidOperationException("Recording failed after all retries.");
         }
-        
+
         /// <summary>
         /// Converts the audio to the format expected by the OpenAI API
         /// </summary>
@@ -111,21 +125,24 @@ namespace semanticKernelSample1.Assistant
             try
             {
                 var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
-                var outputFileName = $"converted_{timestamp}.wav";
+                var outputFileName = $"converted_{_processId}_{timestamp}.wav";
                 var outputPath = Path.Combine(TEMP_AUDIO_FOLDER, outputFileName);
-                
+
                 // Try to use temp folder, fall back to default if needed
                 if (!Directory.Exists(TEMP_AUDIO_FOLDER))
                 {
                     outputPath = "inputaudio.wav";
+                    _logger.LogWarning("Using working directory for converted audio as fallback");
                 }
-                
+
+                var arguments = $"{inputPath} -b {_audioConfig.BitsPerSample} -r {_audioConfig.SampleRate} -c {_audioConfig.Channels} {outputPath}";
+                _logger.LogInformation("Converting audio with arguments: {Arguments}", arguments);
                 var conversionProcess = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
                         FileName = "sox",
-                        Arguments = $"{inputPath} -b 16 -r 24000 -c 1 {outputPath}",
+                        Arguments = arguments,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         UseShellExecute = false,
@@ -133,14 +150,15 @@ namespace semanticKernelSample1.Assistant
                         WorkingDirectory = Directory.GetCurrentDirectory()
                     }
                 };
-                
+
                 Console.WriteLine("Converting audio to appropriate format...");
                 conversionProcess.Start();
                 await conversionProcess.WaitForExitAsync();
-                
+
                 // Ensure file handles are released
                 await Task.Delay(200);
-                
+
+                _logger.LogInformation("Audio converted successfully to {Path}", outputPath);
                 return outputPath;
             }
             catch (Exception ex)
@@ -152,7 +170,7 @@ namespace semanticKernelSample1.Assistant
                 throw;
             }
         }
-        
+
         /// <summary>
         /// Sends the audio file to the OpenAI API for processing
         /// </summary>
@@ -168,17 +186,19 @@ namespace semanticKernelSample1.Assistant
                 {
                     throw new FileNotFoundException($"Audio file not found: {audioPath}");
                 }
-                
+
+                _logger.LogInformation("Sending audio file {Path} to session", audioPath);
                 using (Stream inputAudioStream = File.OpenRead(audioPath))
                 {
                     Console.WriteLine("Sending audio to AI assistant...");
                     await session.SendInputAudioAsync(inputAudioStream);
                 }
-                
+
                 Console.WriteLine("Processing your request...");
                 await session.StartResponseAsync();
-                
+
                 Console.WriteLine("Waiting for assistant response...");
+                _logger.LogInformation("Audio sent and response started successfully");
             }
             catch (Exception ex)
             {
@@ -189,7 +209,7 @@ namespace semanticKernelSample1.Assistant
                 throw;
             }
         }
-        
+
         /// <summary>
         /// Checks if sox is available on the system
         /// </summary>
@@ -198,7 +218,7 @@ namespace semanticKernelSample1.Assistant
             try
             {
                 // First, try a direct approach - just execute sox with version flag
-                var directProcess = new Process
+                using (var directProcess = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -209,30 +229,31 @@ namespace semanticKernelSample1.Assistant
                         UseShellExecute = false,
                         CreateNoWindow = true
                     }
-                };
-                
-                try
+                })
                 {
-                    directProcess.Start();
-                    directProcess.WaitForExit(1000); // Wait up to 1 second
-                    return directProcess.ExitCode == 0;
+                    try
+                    {
+                        directProcess.Start();
+                        directProcess.WaitForExit(1000); // Wait up to 1 second
+                        return directProcess.ExitCode == 0;
+                    }
+                    catch
+                    {
+                        // Sox not directly accessible, continue with path check
+                    }
                 }
-                catch
-                {
-                    // Sox not directly accessible, continue with path check
-                }
-                
+
                 // If direct check fails, try using where/which command
                 string fileName = "where";
                 string arguments = "sox";
-                
+
                 if (!OperatingSystem.IsWindows())
                 {
                     fileName = "which";
                     arguments = "sox";
                 }
-                
-                var process = new Process
+
+                using (var process = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -241,22 +262,23 @@ namespace semanticKernelSample1.Assistant
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         UseShellExecute = false,
-                        CreateNoWindow = true 
+                        CreateNoWindow = true
                     }
-                };
-                
-                process.Start();
-                string output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit();
-                
-                return !string.IsNullOrEmpty(output);
+                })
+                {
+                    process.Start();
+                    string output = process.StandardOutput.ReadToEnd();
+                    process.WaitForExit();
+
+                    return !string.IsNullOrEmpty(output);
+                }
             }
             catch
             {
                 return false;
             }
         }
-        
+
         /// <summary>
         /// Performs a complete audio recording and processing workflow
         /// </summary>
@@ -266,17 +288,20 @@ namespace semanticKernelSample1.Assistant
         {
             try
             {
+                _logger.LogInformation("Starting audio recording and processing workflow");
                 // Record audio from microphone
                 var inputAudioPath = await RecordAudioAsync();
-                
+
                 // Convert audio to proper format
                 var convertedAudioPath = await ConvertAudioAsync(inputAudioPath);
-                
+
                 // Send audio to OpenAI for processing
                 await SendAudioToSessionAsync(session, convertedAudioPath);
-                
+
                 // Clean up the original file
                 TryDeleteFile(inputAudioPath);
+                TryDeleteFile(convertedAudioPath);
+                _logger.LogInformation("Workflow completed and temporary files cleaned up");
             }
             catch (Exception ex)
             {
@@ -284,9 +309,11 @@ namespace semanticKernelSample1.Assistant
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"Error: {ex.Message}");
                 Console.ResetColor();
+                throw;
             }
         }
-          /// <summary>
+
+        /// <summary>
         /// Attempts to delete a file, logging warnings on failure but not throwing exceptions
         /// </summary>
         /// <returns>True if the file was deleted successfully, false otherwise</returns>
@@ -297,6 +324,7 @@ namespace semanticKernelSample1.Assistant
                 if (File.Exists(filePath))
                 {
                     File.Delete(filePath);
+                    _logger.LogDebug("Deleted temporary file: {Path}", filePath);
                     return true;
                 }
                 return false;
@@ -307,7 +335,9 @@ namespace semanticKernelSample1.Assistant
                 _logger.LogWarning(ex, "Could not delete temporary audio file {FilePath}", filePath);
                 return false;
             }
-        }        /// <summary>
+        }
+
+        /// <summary>
         /// Cleans up all temporary audio files from various locations
         /// </summary>
         public void CleanupTempFiles()
@@ -315,7 +345,7 @@ namespace semanticKernelSample1.Assistant
             try
             {
                 var deletedCount = 0;
-                
+
                 // Define all locations to clean
                 var cleanupLocations = new[]
                 {
@@ -326,15 +356,15 @@ namespace semanticKernelSample1.Assistant
                     "bin\\Debug",
                     "bin\\Release"
                 };
-                
+
                 // Define patterns to match
                 var patterns = new[] { "input_*.wav", "output*.wav", "converted_*.wav", "inputaudio.wav" };
-                
+
                 foreach (var location in cleanupLocations.Where(Directory.Exists))
                 {
                     deletedCount += CleanupDirectory(location, patterns);
                 }
-                
+
                 _logger.LogInformation("Temporary audio files cleanup completed. Deleted {Count} files.", deletedCount);
             }
             catch (Exception ex)
@@ -342,18 +372,18 @@ namespace semanticKernelSample1.Assistant
                 _logger.LogError(ex, "Error cleaning up temporary audio files");
             }
         }
-        
+
         /// <summary>
         /// Cleans up audio files in a specific directory using the given patterns
         /// </summary>
         private int CleanupDirectory(string directory, string[] patterns)
         {
             var deletedCount = 0;
-            
+
             foreach (var pattern in patterns)
             {
                 try
-                {
+                    {
                     var files = Directory.GetFiles(directory, pattern);
                     deletedCount += files.Count(TryDeleteFile);
                 }
@@ -362,8 +392,15 @@ namespace semanticKernelSample1.Assistant
                     _logger.LogWarning(ex, "Error cleaning files with pattern {Pattern} in {Directory}", pattern, directory);
                 }
             }
-            
+
             return deletedCount;
         }
+    }
+
+    public class AudioConfig
+    {
+        public int BitsPerSample { get; set; } = 16;
+        public int SampleRate { get; set; } = 24000;
+        public int Channels { get; set; } = 1;
     }
 }
