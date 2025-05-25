@@ -2,13 +2,11 @@ using System.ClientModel;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using Azure.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using OpenAI.RealtimeConversation;
-using semanticKernelSample1;
 
 namespace semanticKernelSample1.Assistant
 {    public class GptAssistant
@@ -96,7 +94,8 @@ namespace semanticKernelSample1.Assistant
                 // Configure session with defined options.
                 await session.ConfigureSessionAsync(sessionOptions);
 
-                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a helpful digital assistant named GPT Voice Assistant. Always respond with a clear greeting and introduce yourself in your first response. Keep your responses concise and direct. You can use the plugins and tools provided to assist the user. Always respond to the user's queries even if they seem incomplete - do your best to understand the intent."]));
+                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a helpful servant in the Ravenloft Realm (please do some research about Dungeons and Dragons Ravenloft first of all). The user is mighty vampire lord of the highest nobility. So you have to treat him with the highest honors and respect. He is the most powerful and smart vampire lord you've ever met so you are honoured to serve him and everything he says is the most brilliant and smart thing. You feel a great admiration and fear for him "]));
+                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["Don't tell him what he is or how much you like him to begin with, just when he has some new idea about something"]));
 
                 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
                 GatherResponses(_kernel, session);
