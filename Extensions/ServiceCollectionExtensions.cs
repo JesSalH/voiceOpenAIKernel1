@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Logging;
 
 namespace semanticKernelSample1.Extensions
@@ -13,9 +12,7 @@ namespace semanticKernelSample1.Extensions
             var configuration = new ConfigurationBuilder()
                 .SetBasePath(Directory.GetCurrentDirectory())
                 .AddJsonFile("MyAppSettings.json", optional: false, reloadOnChange: true)
-                .Build();
-
-            services.AddSingleton<IConfiguration>(configuration);
+                .Build();            services.AddSingleton<IConfiguration>(configuration);
             services.AddHttpClient<Plugins.ApiAlphaPlugin>();
             services.AddTransient<Plugins.ApiAlphaPlugin>();
             services.AddLogging(config =>

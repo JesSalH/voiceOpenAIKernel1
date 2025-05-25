@@ -1,0 +1,74 @@
+        /// <summary>
+        /// Process and send audio to OpenAI API
+        /// </summary>
+        /// <param name="session">The conversation session</param>
+        /// <param name="inputAudioPath">Path to the recorded audio file</param>
+        private async Task ProcessAndSendAudio(RealtimeConversationSession session, string inputAudioPath)
+        {
+            try
+            {
+                // Convert to the expected format with proper command
+                var conversionProcess = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "sox",
+                        Arguments = $"{inputAudioPath} -b 16 -r 24000 -c 1 inputaudio.wav",
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WorkingDirectory = Directory.GetCurrentDirectory()
+                    }
+                };
+                
+                Console.WriteLine("Converting audio to appropriate format...");
+                conversionProcess.Start();
+                await conversionProcess.WaitForExitAsync();
+                
+                // Ensure file handles are released
+                await Task.Delay(200);
+                
+                // Safely delete the input audio file
+                try
+                {
+                    if (File.Exists(inputAudioPath))
+                    {
+                        File.Delete(inputAudioPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Log but continue - this is not critical
+                    _logger.LogWarning(ex, "Could not delete temporary audio file {FilePath}", inputAudioPath);
+                }
+                
+                // Make sure the output file exists before trying to open it
+                if (!File.Exists("inputaudio.wav"))
+                {
+                    throw new FileNotFoundException("Audio conversion failed. Processed audio file not found.");
+                }
+                
+                // Open and send audio stream
+                using (Stream inputAudioStream = File.OpenRead("inputaudio.wav"))
+                {
+                    Console.WriteLine("Sending audio to AI assistant...");
+                    await session.SendInputAudioAsync(inputAudioStream);
+                }
+                
+                // Explicitly start the response processing
+                Console.WriteLine("Processing your request...");
+                await session.StartResponseAsync();
+                
+                // Give the assistant a moment to process the audio transcription
+                Console.WriteLine("Waiting for assistant response...");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing and sending audio");
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error: {ex.Message}");
+                Console.ResetColor();
+                throw;
+            }
+        }

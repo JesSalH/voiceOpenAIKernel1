@@ -7,6 +7,8 @@ using semanticKernelSample1.Assistant;
 using semanticKernelSample1.Plugins;
 using semanticKernelSample1.Extensions;
 
+Console.WriteLine("Starting GPT Voice Assistant...");
+
 // Register configuration and services
 var services = new ServiceCollection().AddAppServices();
 var serviceProvider = services.BuildServiceProvider();
@@ -20,7 +22,7 @@ var builder = Kernel.CreateBuilder().AddOpenAIChatCompletion(modelId, apiKey);
 var kernel = builder.Build();
 var chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
 
-// Register the ApiAlphaPlugin with the kernel using our service provider
+// Register plugins with the kernel using our service provider
 kernel.Plugins.AddFromType<ApiAlphaPlugin>("ApiAlpha", serviceProvider);
 
 // Get logger and create assistant
@@ -38,11 +40,12 @@ foreach (var plugin in kernel.Plugins)
     }
 }
 
-var assistant = new GptAssistant(kernel, chatCompletionService, logger);
+// Create and run the voice-enabled GPT assistant
+var assistant = new GptAssistant(kernel, chatCompletionService, logger, apiKey);
 
-Console.WriteLine("GPT Assistant with API Alpha Plugin is ready!");
-Console.WriteLine("You can ask me about base character names from the API.");
-Console.WriteLine("Type 'exit' or leave empty to quit.\n");
+Console.WriteLine("GPT Voice Assistant with API Alpha Plugin is ready!");
+Console.WriteLine("You will be able to speak to the assistant using your microphone.");
+Console.WriteLine("Follow the prompts to start recording.\n");
 
 // Run the GPT assistant
 await assistant.RunAsync();

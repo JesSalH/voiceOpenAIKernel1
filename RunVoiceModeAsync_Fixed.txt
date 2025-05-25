@@ -1,0 +1,96 @@
+        private async Task RunVoiceModeAsync(RealtimeConversationSession session)
+        {
+            do
+            {
+                Console.WriteLine("\nPress Enter to start recording... Press Enter again to stop.");
+                Console.WriteLine("Type 'voice' to change the assistant's voice, or 'exit' to quit.");
+                
+                string? input = Console.ReadLine();
+                
+                // Handle voice change command
+                if (input?.Equals("voice", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    // Let user select a new voice
+                    Console.WriteLine("\nSelect a new voice for your AI assistant:");
+                    var newVoice = VoiceOptions.SelectVoice();
+                    
+                    try
+                    {
+                        // Create new session options with the selected voice
+                        var newSessionOptions = new ConversationSessionOptions
+                        {
+                            Voice = newVoice,
+                            InputAudioFormat = ConversationAudioFormat.Pcm16,
+                            OutputAudioFormat = ConversationAudioFormat.Pcm16,
+                            InputTranscriptionOptions = new ConversationInputTranscriptionOptions
+                            {
+                                Model = "whisper-1"
+                            }
+                        };
+                        
+                        // Add plugins/function from kernel as session tools.
+                        foreach (var tool in ConvertFunctions(_kernel))
+                        {
+                            newSessionOptions.Tools.Add(tool);
+                        }
+
+                        // If any tools are available, set tool choice to "auto".
+                        if (newSessionOptions.Tools.Count > 0)
+                        {
+                            newSessionOptions.ToolChoice = ConversationToolChoice.CreateAutoToolChoice();
+                        }
+                        
+                        // Reconfigure session with the new options
+                        await session.ConfigureSessionAsync(newSessionOptions);
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"Voice changed successfully to {newVoice}!");
+                        Console.ResetColor();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"Error changing voice: {ex.Message}");
+                        Console.ResetColor();
+                    }
+                    continue;
+                }
+                // Handle exit command
+                else if (input?.Equals("exit", StringComparison.OrdinalIgnoreCase) == true || 
+                         input?.Equals("quit", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    break;
+                }
+                // Handle direct text input (if not empty)
+                else if (!string.IsNullOrEmpty(input))
+                {
+                    // Send text input instead of audio
+                    try
+                    {
+                        await session.AddItemAsync(ConversationItem.CreateUserMessage([input]));
+                        await session.StartResponseAsync();
+                        continue;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"Error sending text input: {ex.Message}");
+                        Console.ResetColor();
+                        continue;
+                    }
+                }
+                
+                // Handle audio recording (when user just presses Enter)
+                try
+                {
+                    // Use the VoiceHandler to record and process audio
+                    await _voiceHandler.RecordAndProcessAudioAsync(session);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error processing audio");
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"Error: {ex.Message}");
+                    Console.ResetColor();
+                }
+            } while (true);
+        }

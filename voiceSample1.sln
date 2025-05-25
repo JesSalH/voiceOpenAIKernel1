@@ -2,7 +2,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "semanticKernelSample1", "semanticKernelSample1.csproj", "{83BEE4F9-AFBA-4186-FF5A-A1F5E8D4A861}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "voiceSample1", "voiceSample1.csproj", "{83BEE4F9-AFBA-4186-FF5A-A1F5E8D4A861}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
