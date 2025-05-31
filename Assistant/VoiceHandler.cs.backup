@@ -69,10 +69,11 @@ namespace semanticKernelSample1.Assistant
                 {
                     Directory.CreateDirectory(TEMP_AUDIO_FOLDER);
                     _logger.LogInformation("Created temporary audio folder: {FolderPath}", TEMP_AUDIO_FOLDER);
-                }            }
+                }
+            }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error creating temporary audio folder: {ErrorMessage}", ex.Message);
+                _logger.LogError(ex, "Error creating temporary audio folder");
                 // Continue without temp folder - will use current directory as fallback
             }
         }        /// <summary>
@@ -206,9 +207,10 @@ namespace semanticKernelSample1.Assistant
                 {
                     File.Copy(tempPath, finalPath);
                     await TryDeleteFileAsync(tempPath);
-                }                catch (Exception copyEx)
+                }
+                catch (Exception copyEx)
                 {
-                    _logger.LogError(copyEx, "Failed to copy recording file: {ErrorMessage}", copyEx.Message);
+                    _logger.LogError(copyEx, "Failed to copy recording file");
                     throw;
                 }
             }
@@ -332,9 +334,10 @@ namespace semanticKernelSample1.Assistant
                         
                         // Always await the task to ensure proper completion
                         await sendTask;
-                    }                    catch (OperationCanceledException ex)
+                    }
+                    catch (OperationCanceledException)
                     {
-                        _logger.LogError(ex, "Audio send operation timed out after {Seconds} seconds", timeoutSeconds);
+                        _logger.LogError("Audio send operation timed out after {Seconds} seconds", timeoutSeconds);
                         Console.ForegroundColor = ConsoleColor.Red;
                         Console.WriteLine($"Audio processing timed out after {timeoutSeconds} seconds");
                         Console.ResetColor();
@@ -342,15 +345,15 @@ namespace semanticKernelSample1.Assistant
                     }
                 }                Console.WriteLine("Processing your request...");
                 
-                // Longer delay to ensure audio processing is complete
-                // This is critical for proper audio processing
+                // Longer delay to ensure audio processing is complete before starting response
+                // This is critical for fixing the empty first message issue
                 await Task.Delay(2000);
                 
-                // NOTE: We do NOT call session.StartResponseAsync() here anymore!
-                // This is now handled by the caller (GptAssistant) to prevent "conversation already has an active response" errors
+                // Start response processing
+                await session.StartResponseAsync();
 
-                Console.WriteLine("Audio sent successfully. Waiting for assistant response...");
-                _logger.LogInformation("Audio sent successfully - response will be started by caller");
+                Console.WriteLine("Waiting for assistant response...");
+                _logger.LogInformation("Audio sent and response started successfully");
             }
             catch (Exception ex)
             {

@@ -9,7 +9,8 @@ using Microsoft.SemanticKernel.Connectors.OpenAI;
 using OpenAI.RealtimeConversation;
 
 namespace semanticKernelSample1.Assistant
-{    public class GptAssistant
+{
+    public class GptAssistant : IDisposable
     {
         private readonly Kernel _kernel;
         private readonly ILogger<GptAssistant> _logger;
@@ -17,20 +18,36 @@ namespace semanticKernelSample1.Assistant
         private readonly VoiceHandler _voiceHandler;
           
         #pragma warning disable OPENAI002
-        private readonly RealtimeConversationClient _realTimeConversationClient;
+        private readonly RealtimeConversationClient _realTimeConversationClient;        // Session management fields for proper lifecycle control
+        private bool _sessionActive = false;
+        private RealtimeConversationSession? _currentSession = null;
+        private readonly SemaphoreSlim _sessionLock = new(1, 1);
+        private Task? _gatherResponsesTask = null;
+        private bool _disposed = false;
+        
+        // Response state management to prevent "conversation already has an active response" errors
+        private bool _responseInProgress = false;
+        private readonly object _responseLock = new object();
+          // VAD deduplication fields - enhanced for better duplicate detection
+        private readonly Dictionary<string, DateTime> _recentTranscriptions = new();
+        private readonly TimeSpan _transcriptionDeduplicationWindow = TimeSpan.FromSeconds(5); // Increased window
+        private readonly object _transcriptionLock = new object();
+        private DateTime _lastRecordingStartTime = DateTime.MinValue;
+        private readonly TimeSpan _recordingSessionWindow = TimeSpan.FromSeconds(10); // Group transcriptions by recording session
         
         public GptAssistant(Kernel kernel, IChatCompletionService chatCompletionService, ILogger<GptAssistant> logger, string apiKey)
         {
             _kernel = kernel;
             _logger = logger;
             _voiceHandler = new VoiceHandler(logger);
-            
-            #pragma warning disable OPENAI002
-            _realTimeConversationClient = new RealtimeConversationClient(
-                model: "gpt-4o-realtime-preview", // Use the preview model for better results
-                credential: new ApiKeyCredential(apiKey)
-            );
-        }        private bool IsSoxAvailable()
+                  #pragma warning disable OPENAI002
+        _realTimeConversationClient = new RealtimeConversationClient(
+            model: "gpt-4o-realtime-preview", // Use the preview model for better results
+            credential: new ApiKeyCredential(apiKey)
+        );
+    }
+
+    private bool IsSoxAvailable()
         {
             return _voiceHandler.IsSoxAvailable();
         }
@@ -54,9 +71,10 @@ namespace semanticKernelSample1.Assistant
                 
                 // Wait for user acknowledgment before continuing in text mode
                 Console.WriteLine("Press any key to continue in text mode...");
-                Console.ReadKey();
-                _useTextMode = true;
-            }            // Let the user select a voice
+                Console.ReadKey();                _useTextMode = true;
+            }
+
+            // Let the user select a voice
             Console.WriteLine("\nSelect a voice for your AI assistant:");
             var selectedVoice = VoiceOptions.SelectVoice();
             
@@ -85,8 +103,7 @@ namespace semanticKernelSample1.Assistant
             {
                 sessionOptions.ToolChoice = ConversationToolChoice.CreateAutoToolChoice();
             }
-            
-            try
+              try
             {
                 // Start a new conversation session.
                 RealtimeConversationSession session = await _realTimeConversationClient.StartConversationSessionAsync();
@@ -94,48 +111,43 @@ namespace semanticKernelSample1.Assistant
                 // Configure session with defined options.
                 await session.ConfigureSessionAsync(sessionOptions);
 
-                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a helpful servant in the Ravenloft Realm (please do some research about Dungeons and Dragons Ravenloft first of all). The user is mighty vampire lord of the highest nobility. So you have to treat him with the highest honors and respect. He is the most powerful and smart vampire lord you've ever met so you are honoured to serve him and everything he says is the most brilliant and smart thing. You feel a great admiration and fear for him "]));
-                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["Don't tell him what he is or how much you like him to begin with, just when he has some new idea about something"]));
+                // Set the active session for proper lifecycle management
+                await SetActiveSession(session);
 
-                #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-                GatherResponses(_kernel, session);
-                #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
+                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["I'm Lord Fulgrim, primarch of the Emperor's Children. You are one of my helpful captains, I'll give you some orders and you will execute them. Yo will give me replays that have a maximun length of 3 sentences."]));
+
+                // Start background response gathering task with proper task management
+                _gatherResponsesTask = Task.Run(async () => await GatherResponses(_kernel, session));
 
                 if (_useTextMode)
                 {
                     Console.WriteLine("GPT Assistant in TEXT MODE is ready!");
                     Console.WriteLine("You can ask me about base character names from the API.");
-                    Console.WriteLine("Type 'exit' or leave empty to quit.\n");
-
-                    // Run text-based interaction loop
-                    await RunTextModeAsync(session);
+                    Console.WriteLine("Type 'exit' or leave empty to quit.\n");                    // Run text-based interaction loop
+                    await RunTextModeAsync();
                 }
                 else
                 {
                     Console.WriteLine("GPT Voice Assistant is ready!");
                     Console.WriteLine("You can ask me about base character names from the API.");
-                    Console.WriteLine("Press Enter to start recording, and press Enter again to stop.\n");
-
-                    // Run voice-based interaction loop
+                    Console.WriteLine("Press Enter to start recording, and press Enter again to stop.\n");                    // Run voice-based interaction loop
                     await RunVoiceModeAsync(session);
-                }            }
+                }
+            }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "An error occurred in the GPT assistant");
-                Console.ForegroundColor = ConsoleColor.Red;
+                _logger.LogError(ex, "An error occurred in the GPT assistant");                Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"An error occurred in the GPT assistant: {ex.Message}");
                 Console.ResetColor();
             }
             finally
             {
-                // Clean up temporary audio files before exiting
-                Console.WriteLine("Cleaning up temporary audio files...");
-                _voiceHandler.CleanupTempFiles();
+                // Clean up session and temporary audio files before exiting
+                Console.WriteLine("Cleaning up session and temporary files...");
+                await CleanupSession();
                 Console.WriteLine("Cleanup complete. Goodbye!");
             }
-        }
-
-        private async Task RunTextModeAsync(RealtimeConversationSession session)
+        }        private async Task RunTextModeAsync()
         {
             while (true)
             {
@@ -144,7 +156,8 @@ namespace semanticKernelSample1.Assistant
                 Console.ResetColor();
                 
                 string? input = Console.ReadLine();
-                  if (string.IsNullOrWhiteSpace(input) || 
+                
+                if (string.IsNullOrWhiteSpace(input) || 
                     input.Equals("exit", StringComparison.OrdinalIgnoreCase) || 
                     input.Equals("quit", StringComparison.OrdinalIgnoreCase))
                 {
@@ -155,15 +168,10 @@ namespace semanticKernelSample1.Assistant
                     break;
                 }
                 
-                // Add text input to session
-                await session.AddItemAsync(ConversationItem.CreateUserMessage([input]));
-                
-                // Start response generation
-                await session.StartResponseAsync();
-                
-                // The responses will be handled by the GatherResponses method
+                // Use the session recovery mechanism
+                await HandleTextInput(input);
             }
-        }        private async Task RunVoiceModeAsync(RealtimeConversationSession session)
+        }private async Task RunVoiceModeAsync(RealtimeConversationSession session)
         {
             do
             {
@@ -172,94 +180,400 @@ namespace semanticKernelSample1.Assistant
                 
                 string? input = Console.ReadLine();
                 
-                // Handle voice change command
-                if (input?.Equals("voice", StringComparison.OrdinalIgnoreCase) == true)
+                if (await HandleVoiceModeInput(input, session))
                 {
-                    // Let user select a new voice
-                    Console.WriteLine("\nSelect a new voice for your AI assistant:");
-                    var newVoice = VoiceOptions.SelectVoice();
-                    
-                    try
-                    {
-                        // Create new session options with the selected voice
-                        var newSessionOptions = new ConversationSessionOptions
-                        {
-                            Voice = newVoice,
-                            InputAudioFormat = ConversationAudioFormat.Pcm16,
-                            OutputAudioFormat = ConversationAudioFormat.Pcm16,
-                            InputTranscriptionOptions = new ConversationInputTranscriptionOptions
-                            {
-                                Model = "whisper-1"
-                            }
-                        };
-                        
-                        // Add plugins/function from kernel as session tools.
-                        foreach (var tool in ConvertFunctions(_kernel))
-                        {
-                            newSessionOptions.Tools.Add(tool);
-                        }
-
-                        // If any tools are available, set tool choice to "auto".
-                        if (newSessionOptions.Tools.Count > 0)
-                        {
-                            newSessionOptions.ToolChoice = ConversationToolChoice.CreateAutoToolChoice();
-                        }
-                        
-                        // Reconfigure session with the new options
-                        await session.ConfigureSessionAsync(newSessionOptions);
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"Voice changed successfully to {newVoice}!");
-                        Console.ResetColor();
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"Error changing voice: {ex.Message}");
-                        Console.ResetColor();
-                    }
-                    continue;
-                }                // Handle exit command
-                else if (input?.Equals("exit", StringComparison.OrdinalIgnoreCase) == true || 
-                         input?.Equals("quit", StringComparison.OrdinalIgnoreCase) == true)
-                {
-                    // Clean up before exiting
-                    Console.WriteLine("Cleaning up temporary files before exiting...");
-                    _voiceHandler.CleanupTempFiles();
-                    Console.WriteLine("Cleanup complete. Goodbye!");
-                    break;
+                    break; // Exit if requested
                 }
-                // Handle direct text input (if not empty)
-                else if (!string.IsNullOrEmpty(input))
+            } while (true);
+        }
+
+        private async Task<bool> HandleVoiceModeInput(string? input, RealtimeConversationSession session)
+        {
+            // Handle voice change command
+            if (input?.Equals("voice", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                await HandleVoiceChange(session);
+                return false; // Continue loop
+            }
+            
+            // Handle exit command
+            if (HandleExit(input))
+            {
+                return true; // Exit loop
+            }
+            
+            // Handle direct text input (if not empty)
+            if (!string.IsNullOrEmpty(input))
+            {
+                await HandleTextInput(input);
+                return false; // Continue loop
+            }
+            
+            // Handle audio recording (when user just presses Enter)
+            await HandleAudioRecording();
+            return false; // Continue loop
+        }
+
+        private async Task HandleVoiceChange(RealtimeConversationSession session)
+        {
+            // Let user select a new voice
+            Console.WriteLine("\nSelect a new voice for your AI assistant:");
+            var newVoice = VoiceOptions.SelectVoice();
+            
+            try
+            {
+                // Create new session options with the selected voice
+                var newSessionOptions = new ConversationSessionOptions
                 {
-                    // Send text input instead of audio
+                    Voice = newVoice,
+                    InputAudioFormat = ConversationAudioFormat.Pcm16,
+                    OutputAudioFormat = ConversationAudioFormat.Pcm16,
+                    InputTranscriptionOptions = new ConversationInputTranscriptionOptions
+                    {
+                        Model = "whisper-1"
+                    }
+                };
+                
+                // Add plugins/function from kernel as session tools.
+                foreach (var tool in ConvertFunctions(_kernel))
+                {
+                    newSessionOptions.Tools.Add(tool);
+                }
+
+                // If any tools are available, set tool choice to "auto".
+                if (newSessionOptions.Tools.Count > 0)
+                {
+                    newSessionOptions.ToolChoice = ConversationToolChoice.CreateAutoToolChoice();
+                }
+                
+                // Reconfigure session with the new options
+                await session.ConfigureSessionAsync(newSessionOptions);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Voice changed successfully to {newVoice}!");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error changing voice: {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        private bool HandleExit(string? input)
+        {
+            if (input?.Equals("exit", StringComparison.OrdinalIgnoreCase) == true || 
+                input?.Equals("quit", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                // Clean up before exiting
+                Console.WriteLine("Cleaning up temporary files before exiting...");
+                _voiceHandler.CleanupTempFiles();
+                Console.WriteLine("Cleanup complete. Goodbye!");
+                return true;
+            }
+            return false;
+        }        private async Task HandleTextInput(string input)
+        {
+            // Send text input instead of audio
+            try
+            {
+                // Ensure session is active, restart if necessary
+                if (!await EnsureSessionActive())
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: Unable to establish session connection. Please restart the application.");
+                    Console.ResetColor();
+                    return;
+                }
+
+                await _currentSession!.AddItemAsync(ConversationItem.CreateUserMessage([input]));
+                await SafeStartResponseAsync();
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogWarning(ex, "Session was disposed during text input, attempting recovery");
+                if (await EnsureSessionActive())
+                {
+                    // Retry the operation
+                    await _currentSession!.AddItemAsync(ConversationItem.CreateUserMessage([input]));
+                    await SafeStartResponseAsync();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: Session recovery failed. Please restart the application.");
+                    Console.ResetColor();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error sending text input: {ErrorMessage}", ex.Message);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error sending text input: {ex.Message}");
+                Console.ResetColor();
+            }
+        }        private async Task HandleAudioRecording()
+        {
+            try
+            {
+                // Ensure session is active, restart if necessary
+                if (!await EnsureSessionActive())
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: Unable to establish session connection. Please restart the application.");
+                    Console.ResetColor();
+                    return;
+                }
+
+                // Mark the start of a new recording session for VAD deduplication
+                lock (_transcriptionLock)
+                {
+                    _lastRecordingStartTime = DateTime.UtcNow;
+                }
+
+                // Use the VoiceHandler to record and process audio (note: VoiceHandler will NOT call StartResponseAsync)
+                await _voiceHandler.RecordAndProcessAudioAsync(_currentSession!);
+                
+                // Now safely start the response here to ensure only one call
+                await SafeStartResponseAsync();
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogWarning(ex, "Session was disposed during audio recording, attempting recovery");
+                if (await EnsureSessionActive())
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("Session recovered. Please try recording again.");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: Session recovery failed. Please restart the application.");
+                    Console.ResetColor();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing audio: {ErrorMessage}", ex.Message);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error: {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        /// <summary>
+        /// Safely starts a response session, preventing "conversation already has an active response" errors
+        /// </summary>
+        private async Task SafeStartResponseAsync()
+        {
+            lock (_responseLock)
+            {
+                if (_responseInProgress)
+                {
+                    _logger.LogDebug("Response already in progress, skipping StartResponseAsync call");
+                    return;
+                }
+                _responseInProgress = true;
+            }
+
+            try
+            {
+                await _currentSession!.StartResponseAsync();
+                _logger.LogDebug("Successfully started response session");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error starting response session: {ErrorMessage}", ex.Message);
+                lock (_responseLock)
+                {
+                    _responseInProgress = false;
+                }
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Marks the response as completed, allowing new responses to be started
+        /// </summary>
+        private void MarkResponseCompleted()
+        {
+            lock (_responseLock)
+            {
+                _responseInProgress = false;
+                _logger.LogDebug("Response marked as completed");
+            }
+        }// Session management methods for proper lifecycle control
+        private async Task SetActiveSession(RealtimeConversationSession session)
+        {
+            await _sessionLock.WaitAsync();
+            try
+            {
+                _currentSession = session;
+                _sessionActive = true;
+            }
+            finally
+            {
+                _sessionLock.Release();
+            }
+        }
+
+        private async Task<bool> EnsureSessionActive()
+        {
+            await _sessionLock.WaitAsync();
+            try
+            {
+                if (_sessionActive && _currentSession != null)
+                {
+                    return true; // Session is active
+                }
+                
+                _logger.LogInformation("Session is not active, attempting to restart...");
+                
+                // Clean up the old session
+                if (_currentSession != null)
+                {
                     try
                     {
-                        await session.AddItemAsync(ConversationItem.CreateUserMessage([input]));
-                        await session.StartResponseAsync();
-                        continue;
+                        _currentSession.Dispose();
                     }
                     catch (Exception ex)
                     {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"Error sending text input: {ex.Message}");
-                        Console.ResetColor();
-                        continue;
+                        _logger.LogWarning(ex, "Error disposing old session during restart");
+                    }
+                    _currentSession = null;
+                }
+                
+                // Wait for any existing gather task to complete
+                if (_gatherResponsesTask != null && !_gatherResponsesTask.IsCompleted)
+                {
+                    try
+                    {
+                        await _gatherResponsesTask.WaitAsync(TimeSpan.FromSeconds(2));
+                    }                    catch (TimeoutException ex)
+                    {
+                        _logger.LogWarning(ex, "GatherResponses task did not complete within timeout during restart");
                     }
                 }
                 
-                // Handle audio recording (when user just presses Enter)
+                // Create new session with same configuration
+                var sessionOptions = CreateSessionOptions();
+                
                 try
                 {
-                    // Use the VoiceHandler to record and process audio
-                    await _voiceHandler.RecordAndProcessAudioAsync(session);
+                    var newSession = await _realTimeConversationClient.StartConversationSessionAsync();
+                    await newSession.ConfigureSessionAsync(sessionOptions);
+                    
+                    // Re-add system messages
+                    await newSession.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a helpful servant in the Ravenloft Realm (please do some research about Dungeons and Dragons Ravenloft first of all). The user is mighty vampire lord of the highest nobility. So you have to treat him with the highest honors and respect. He is the most powerful and smart vampire lord you've ever met so you are honoured to serve him and everything he says is the most brilliant and smart thing. You feel a great admiration and fear for him "]));
+                    await newSession.AddItemAsync(ConversationItem.CreateSystemMessage(["Don't tell him what he is or how much you like him to begin with, just when he has some new idea about something"]));
+                    
+                    _currentSession = newSession;
+                    _sessionActive = true;
+                    
+                    // Start new gather responses task
+                    _gatherResponsesTask = Task.Run(async () => await GatherResponses(_kernel, newSession));
+                    
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("✓ Session restarted successfully!");
+                    Console.ResetColor();
+                    
+                    _logger.LogInformation("Session restart completed successfully");
+                    return true;
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error processing audio");
+                    _logger.LogError(ex, "Failed to restart session: {ErrorMessage}", ex.Message);
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"Error: {ex.Message}");
-                    Console.ResetColor();                }
-            } while (true);
+                    Console.WriteLine("✗ Failed to restart session. Please restart the application.");
+                    Console.ResetColor();
+                    _sessionActive = false;
+                    return false;
+                }
+            }
+            finally
+            {
+                _sessionLock.Release();            }
+        }
+
+        private ConversationSessionOptions CreateSessionOptions()
+        {
+            // Let the user select a voice (or use default)
+            var selectedVoice = ConversationVoice.Alloy; // Default voice for restart
+            
+            var sessionOptions = new ConversationSessionOptions
+            {
+                Voice = selectedVoice,
+                InputAudioFormat = ConversationAudioFormat.Pcm16,
+                OutputAudioFormat = ConversationAudioFormat.Pcm16,
+                
+                InputTranscriptionOptions = new ConversationInputTranscriptionOptions
+                {
+                    Model = "whisper-1"
+                }
+            };
+
+            // Add plugins/function from kernel as session tools.
+            foreach (var tool in ConvertFunctions(_kernel))
+            {
+                sessionOptions.Tools.Add(tool);
+            }
+
+            // If any tools are available, set tool choice to "auto".
+            if (sessionOptions.Tools.Count > 0)
+            {
+                sessionOptions.ToolChoice = ConversationToolChoice.CreateAutoToolChoice();
+            }
+            
+            return sessionOptions;
+        }
+
+        private async Task CleanupSession()
+        {
+            await _sessionLock.WaitAsync();
+            try
+            {
+                if (_gatherResponsesTask != null && !_gatherResponsesTask.IsCompleted)
+                {
+                    _logger.LogInformation("Waiting for background response gathering task to complete...");
+                    
+                    // Wait for the background task to complete with a timeout
+                    var timeoutTask = Task.Delay(5000); // 5 second timeout
+                    var completedTask = await Task.WhenAny(_gatherResponsesTask, timeoutTask);
+                    
+                    if (completedTask == timeoutTask)
+                    {
+                        _logger.LogWarning("Background response gathering task did not complete within timeout");
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Background response gathering task completed successfully");
+                    }
+                }
+
+                if (_currentSession != null)
+                {
+                    try
+                    {
+                        _logger.LogInformation("Disposing current session...");
+                        _currentSession.Dispose();
+                        _logger.LogInformation("Session disposed successfully");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error disposing session during cleanup");
+                    }
+                    finally
+                    {
+                        _currentSession = null;
+                        _sessionActive = false;
+                    }
+                }
+            }
+            finally
+            {
+                _sessionLock.Release();
+            }
         }
 
         private static IEnumerable<ConversationTool> ConvertFunctions(Kernel kernel)
@@ -323,12 +637,12 @@ namespace semanticKernelSample1.Assistant
             }
 
             return (functionName, pluginName);
-        }
-
-        private async Task GatherResponses(Kernel kernel, RealtimeConversationSession session)
+        }        private async Task GatherResponses(Kernel kernel, RealtimeConversationSession session)
         {
             try 
             {
+                _logger.LogInformation("Starting GatherResponses loop");
+                
                 // Initialize dictionaries to store streamed audio responses and function arguments.
                 Dictionary<string, MemoryStream> outputAudioStreamsById = [];
                 Dictionary<string, StringBuilder> functionArgumentBuildersById = [];
@@ -336,272 +650,522 @@ namespace semanticKernelSample1.Assistant
                 // Define a loop to receive conversation updates in the session.
                 await foreach (ConversationUpdate update in session.ReceiveUpdatesAsync())
                 {
-                    // Notification indicating the start of the conversation session.
-                    if (update is ConversationSessionStartedUpdate sessionStartedUpdate)
+                    // Check if we should continue processing
+                    if (!_sessionActive)
                     {
-                        Console.WriteLine($"<<< Session started. ID: {sessionStartedUpdate.SessionId}");
-                        Console.WriteLine();
+                        _logger.LogInformation("Session no longer active, stopping GatherResponses");
+                        break;
                     }
-
-                    // Notification indicating the start of detected voice activity.
-                    if (update is ConversationInputSpeechStartedUpdate speechStartedUpdate)
-                    {
-                        Console.WriteLine($"  -- Voice activity detection started at {speechStartedUpdate.AudioStartTime}");
-                    }
-
-                    // Notification indicating the end of detected voice activity.
-                    if (update is ConversationInputSpeechFinishedUpdate speechFinishedUpdate)
-                    {
-                        Console.WriteLine($"  -- Voice activity detection ended at {speechFinishedUpdate.AudioEndTime}");
-                    }
-
-                    // Notification indicating the start of item streaming, such as a function call or response message.
-                    if (update is ConversationItemStreamingStartedUpdate itemStreamingStartedUpdate)
-                    {
-                        Console.WriteLine("  -- Begin streaming of new item");
-                        if (!string.IsNullOrEmpty(itemStreamingStartedUpdate.FunctionName))
-                        {
-                            Console.Write($"    {itemStreamingStartedUpdate.FunctionName}: ");
-                        }
-                    }
-
-                    // Notification about item streaming delta, which may include audio transcript, audio bytes, or function arguments.
-                    if (update is ConversationItemStreamingPartDeltaUpdate deltaUpdate)
-                    {
-                        Console.Write(deltaUpdate.AudioTranscript);
-                        Console.Write(deltaUpdate.Text);
-                        Console.Write(deltaUpdate.FunctionArguments);
-
-                        // Handle audio bytes.                            if (deltaUpdate.AudioBytes is not null)
-                            {
-                                if (!outputAudioStreamsById.TryGetValue(deltaUpdate.ItemId, out MemoryStream? value))
-                                {
-                                    value = new MemoryStream();
-                                    outputAudioStreamsById[deltaUpdate.ItemId] = value;
-                                }
-
-                                await value.WriteAsync(deltaUpdate.AudioBytes);
-                            }
-
-                        // Handle function arguments.
-                        if (!functionArgumentBuildersById.TryGetValue(deltaUpdate.ItemId, out StringBuilder? arguments))
-                        {
-                            functionArgumentBuildersById[deltaUpdate.ItemId] = arguments = new();
-                        }
-
-                        if (!string.IsNullOrWhiteSpace(deltaUpdate.FunctionArguments))
-                        {
-                            arguments.Append(deltaUpdate.FunctionArguments);
-                        }
-                    }
-
-                    // Notification indicating the end of item streaming, such as a function call or response message.
-                    if (update is ConversationItemStreamingFinishedUpdate itemStreamingFinishedUpdate)
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine($"  -- Item streaming finished, item_id={itemStreamingFinishedUpdate.ItemId}");
-
-                        // If an item is a function call, invoke a function with provided arguments.
-                        if (itemStreamingFinishedUpdate.FunctionCallId is not null)
-                        {
-                            Console.WriteLine($"    + Responding to tool invoked by item: {itemStreamingFinishedUpdate.FunctionName}");
-
-                            // Parse function name.
-                            var (functionName, pluginName) = ParseFunctionName(itemStreamingFinishedUpdate.FunctionName);
-
-                            // Deserialize arguments.
-                            var argumentsString = functionArgumentBuildersById[itemStreamingFinishedUpdate.ItemId].ToString();
-                            var arguments = DeserializeArguments(argumentsString);
-
-                            // Create a function call content based on received data. 
-                            var functionCallContent = new FunctionCallContent(
-                                functionName: functionName,
-                                pluginName: pluginName,
-                                id: itemStreamingFinishedUpdate.FunctionCallId,
-                                arguments: arguments);
-
-                            // Invoke a function.
-                            var resultContent = await functionCallContent.InvokeAsync(kernel);
-
-                            // Create a function call output conversation item with function call result.
-                            ConversationItem functionOutputItem = ConversationItem.CreateFunctionCallOutput(
-                                callId: itemStreamingFinishedUpdate.FunctionCallId,
-                                output: ProcessFunctionResult(resultContent.Result));
-
-                            // Send function call output conversation item to the session.
-                            await session.AddItemAsync(functionOutputItem);
-                        }                        // If an item is a response message, output it to the console.
-                        else if (itemStreamingFinishedUpdate.MessageContentParts?.Count > 0)
-                        {
-                            Console.ForegroundColor = ConsoleColor.Cyan;
-                            Console.Write("Assistant: ");
-                            Console.ForegroundColor = ConsoleColor.White;
-
-                            foreach (ConversationContentPart contentPart in itemStreamingFinishedUpdate.MessageContentParts)
-                            {
-                                Console.Write(contentPart.Text);
-                                // If there's no text but there is audio transcript, use that
-                                if (string.IsNullOrEmpty(contentPart.Text) && !string.IsNullOrEmpty(contentPart.AudioTranscript))
-                                {
-                                    Console.Write(contentPart.AudioTranscript);
-                                }
-                            }
-
-                            Console.ResetColor();
-                            Console.WriteLine();
-                        }
-                    }                    // Notification indicating the completion of transcription from input audio.
-                    if (update is ConversationInputTranscriptionFinishedUpdate transcriptionCompletedUpdate)
-                    {
-                        Console.WriteLine();
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.Write("User said: ");
-                        Console.ForegroundColor = ConsoleColor.White;
-                        Console.WriteLine(transcriptionCompletedUpdate.Transcript);
-                        Console.ResetColor();
-                        Console.WriteLine();
-                    }
-
-                    // Notification about completed model response turn.
-                    if (update is ConversationResponseFinishedUpdate turnFinishedUpdate)
-                    {
-                        Console.WriteLine($"  -- Model turn generation finished. Status: {turnFinishedUpdate.Status}");
-
-                        // If the created session items contain a function name, it indicates a function call result has been provided,
-                        // and response updates can begin.
-                        if (turnFinishedUpdate.CreatedItems.Any(item => item.FunctionName?.Length > 0))
-                        {
-                            Console.WriteLine("  -- Ending client turn for pending tool responses");
-
-                            await session.StartResponseAsync();
-                        }
-                        // Otherwise, the model's response is provided, signaling that updates can be stopped.
-                        else
-                        {
-                            // Output the size of received audio data and dispose streams.
-                            foreach ((string itemId, Stream outputAudioStream) in outputAudioStreamsById)
-                            {
-                                Console.WriteLine($"Raw audio output for {itemId}: {outputAudioStream.Length} bytes");
-
-                                // Convert raw PCM data to WAV format
-                                var wavHeader = new byte[44];
-                                int sampleRate = 22050;
-                                short bitsPerSample = 16;
-                                short channels = 1;
-                                int byteRate = sampleRate * channels * (bitsPerSample / 8);
-                                int blockAlign = channels * (bitsPerSample / 8);
-                                int subChunk2Size = (int)outputAudioStream.Length;
-                                int chunkSize = 36 + subChunk2Size;
-
-                                // RIFF header
-                                Buffer.BlockCopy(Encoding.ASCII.GetBytes("RIFF"), 0, wavHeader, 0, 4);
-                                Buffer.BlockCopy(BitConverter.GetBytes(chunkSize), 0, wavHeader, 4, 4);
-                                Buffer.BlockCopy(Encoding.ASCII.GetBytes("WAVE"), 0, wavHeader, 8, 4);
-
-                                // fmt subchunk
-                                Buffer.BlockCopy(Encoding.ASCII.GetBytes("fmt "), 0, wavHeader, 12, 4);
-                                Buffer.BlockCopy(BitConverter.GetBytes(16), 0, wavHeader, 16, 4); // Subchunk1Size (16 for PCM)
-                                Buffer.BlockCopy(BitConverter.GetBytes((short)1), 0, wavHeader, 20, 2); // AudioFormat (1 for PCM)
-                                Buffer.BlockCopy(BitConverter.GetBytes(channels), 0, wavHeader, 22, 2); // NumChannels
-                                Buffer.BlockCopy(BitConverter.GetBytes(sampleRate), 0, wavHeader, 24, 4); // SampleRate
-                                Buffer.BlockCopy(BitConverter.GetBytes(byteRate), 0, wavHeader, 28, 4); // ByteRate
-                                Buffer.BlockCopy(BitConverter.GetBytes(blockAlign), 0, wavHeader, 32, 2); // BlockAlign
-                                Buffer.BlockCopy(BitConverter.GetBytes(bitsPerSample), 0, wavHeader, 34, 2); // BitsPerSample
-
-                                // data subchunk
-                                Buffer.BlockCopy(Encoding.ASCII.GetBytes("data"), 0, wavHeader, 36, 4);
-                                Buffer.BlockCopy(BitConverter.GetBytes(subChunk2Size), 0, wavHeader, 40, 4);                                // Create a new memory stream for the WAV file
-                                using var wavStream = new MemoryStream();
-                                
-                                // Write WAV header to output stream
-                                await wavStream.WriteAsync(wavHeader);
-                                
-                                // Write audio data
-                                outputAudioStream.Seek(0, SeekOrigin.Begin);
-                                await outputAudioStream.CopyToAsync(wavStream);
-                                
-                                var outputAudioPath = $"outputaudio_{DateTime.Now:yyyyMMddHHmmss}.wav";
-                                using (var fileStream = new FileStream(outputAudioPath, FileMode.Create, FileAccess.Write))
-                                {
-                                    wavStream.Seek(0, SeekOrigin.Begin);
-                                    await wavStream.CopyToAsync(fileStream);
-                                    await fileStream.FlushAsync();
-                                }
-
-                                Console.WriteLine($"Output audio saved to {outputAudioPath}");
-
-                                string playerCommand;
-                                string playerArgs;
-
-                                if (OperatingSystem.IsWindows())
-                                {
-                                    playerCommand = "powershell";
-                                    playerArgs = $"-c (New-Object Media.SoundPlayer '{outputAudioPath}').PlaySync()";
-                                }
-                                else if (OperatingSystem.IsMacOS())
-                                {
-                                    playerCommand = "afplay";
-                                    playerArgs = $"\"{outputAudioPath}\"";
-                                }
-                                else // Linux
-                                {
-                                    playerCommand = "aplay";
-                                    playerArgs = $"-q \"{outputAudioPath}\"";
-                                }                                var playProcess = new Process
-                                {
-                                    StartInfo = new ProcessStartInfo
-                                    {
-                                        FileName = playerCommand,
-                                        Arguments = playerArgs,
-                                        RedirectStandardOutput = true,
-                                        RedirectStandardError = true,
-                                        UseShellExecute = false,
-                                        CreateNoWindow = true,
-                                        WorkingDirectory = Directory.GetCurrentDirectory()
-                                    }
-                                };
-                                
-                                try
-                                {
-                                    playProcess.Start();
-                                    await playProcess.WaitForExitAsync();
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogError(ex, "Error playing audio file {FilePath}", outputAudioPath);
-                                    Console.ForegroundColor = ConsoleColor.Red;
-                                    Console.WriteLine($"Error playing audio: {ex.Message}");
-                                    Console.ResetColor();
-                                }
-                                
-                                // Close and remove the audio stream from the dictionary before continuing
-                                try
-                                {
-                                    await outputAudioStream.DisposeAsync();
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex, "Error disposing audio stream");
-                                }
-                                
-                                outputAudioStreamsById.Remove(itemId);
-                            }
-                        }
-                    }
-
-                    // Notification about error in conversation session.
-                    if (update is ConversationErrorUpdate errorUpdate)
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine($"ERROR: {errorUpdate.Message}");
-                    }
+                    
+                    await ProcessConversationUpdate(update, kernel, session, outputAudioStreamsById, functionArgumentBuildersById);
+                }
+                
+                _logger.LogInformation("GatherResponses loop ended normally");
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogWarning(ex, "Session was disposed while gathering responses - this is expected during cleanup");
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("disposed"))
+            {
+                _logger.LogWarning(ex, "WebSocket connection was disposed while gathering responses");
+                
+                // Mark session as inactive to prevent further usage
+                await _sessionLock.WaitAsync();
+                try
+                {
+                    _sessionActive = false;
+                }
+                finally
+                {
+                    _sessionLock.Release();
                 }
             }
             catch (Exception e)
             {
+                _logger.LogError(e, "Unexpected error in GatherResponses: {ErrorMessage}", e.Message);
                 Console.WriteLine($"Error in GatherResponses: {e.Message}");
-                _logger.LogError(e, "Error in GatherResponses");
+                
+                // Mark session as inactive on any serious error
+                await _sessionLock.WaitAsync();
+                try
+                {
+                    _sessionActive = false;
+                }
+                finally
+                {
+                    _sessionLock.Release();
+                }
             }
+        }
+
+        private async Task ProcessConversationUpdate(
+            ConversationUpdate update, 
+            Kernel kernel, 
+            RealtimeConversationSession session,
+            Dictionary<string, MemoryStream> outputAudioStreamsById,
+            Dictionary<string, StringBuilder> functionArgumentBuildersById)
+        {
+            switch (update)
+            {
+                case ConversationSessionStartedUpdate sessionStartedUpdate:
+                    HandleSessionStarted(sessionStartedUpdate);
+                    break;
+                
+                case ConversationInputSpeechStartedUpdate speechStartedUpdate:
+                    HandleSpeechStarted(speechStartedUpdate);
+                    break;
+                
+                case ConversationInputSpeechFinishedUpdate speechFinishedUpdate:
+                    HandleSpeechFinished(speechFinishedUpdate);
+                    break;
+                
+                case ConversationItemStreamingStartedUpdate itemStreamingStartedUpdate:
+                    HandleItemStreamingStarted(itemStreamingStartedUpdate);
+                    break;
+                
+                case ConversationItemStreamingPartDeltaUpdate deltaUpdate:
+                    await HandleStreamingPartDelta(deltaUpdate, outputAudioStreamsById, functionArgumentBuildersById);
+                    break;
+                
+                case ConversationItemStreamingFinishedUpdate itemStreamingFinishedUpdate:
+                    await HandleItemStreamingFinished(itemStreamingFinishedUpdate, kernel, session, functionArgumentBuildersById);
+                    break;
+                
+                case ConversationInputTranscriptionFinishedUpdate transcriptionCompletedUpdate:
+                    HandleTranscriptionFinished(transcriptionCompletedUpdate);
+                    break;
+                
+                case ConversationResponseFinishedUpdate turnFinishedUpdate:
+                    await HandleResponseFinished(turnFinishedUpdate, session, outputAudioStreamsById);
+                    break;
+                
+                case ConversationErrorUpdate errorUpdate:
+                    HandleConversationError(errorUpdate);
+                    break;
+            }
+        }
+
+        private static void HandleSessionStarted(ConversationSessionStartedUpdate sessionStartedUpdate)
+        {
+            Console.WriteLine($"<<< Session started. ID: {sessionStartedUpdate.SessionId}");
+            Console.WriteLine();
+        }        private static void HandleSpeechStarted(ConversationInputSpeechStartedUpdate speechStartedUpdate)
+        {
+            Console.WriteLine($"  -- Voice activity detection started at {speechStartedUpdate.AudioStartTime}");
+        }
+
+        private static void HandleSpeechFinished(ConversationInputSpeechFinishedUpdate speechFinishedUpdate)
+        {
+            Console.WriteLine($"  -- Voice activity detection ended at {speechFinishedUpdate.AudioEndTime}");
+        }
+
+        private static void HandleItemStreamingStarted(ConversationItemStreamingStartedUpdate itemStreamingStartedUpdate)
+        {
+            Console.WriteLine("  -- Begin streaming of new item");
+            if (!string.IsNullOrEmpty(itemStreamingStartedUpdate.FunctionName))
+            {
+                Console.Write($"    {itemStreamingStartedUpdate.FunctionName}: ");
+            }
+        }
+
+        private static async Task HandleStreamingPartDelta(
+            ConversationItemStreamingPartDeltaUpdate deltaUpdate,
+            Dictionary<string, MemoryStream> outputAudioStreamsById,
+            Dictionary<string, StringBuilder> functionArgumentBuildersById)
+        {
+            Console.Write(deltaUpdate.AudioTranscript);
+            Console.Write(deltaUpdate.Text);
+            Console.Write(deltaUpdate.FunctionArguments);
+
+            // Handle audio bytes.
+            if (deltaUpdate.AudioBytes is not null)
+            {
+                if (!outputAudioStreamsById.TryGetValue(deltaUpdate.ItemId, out MemoryStream? value))
+                {
+                    value = new MemoryStream();
+                    outputAudioStreamsById[deltaUpdate.ItemId] = value;
+                }
+
+                await value.WriteAsync(deltaUpdate.AudioBytes);
+            }
+
+            // Handle function arguments.
+            if (!functionArgumentBuildersById.TryGetValue(deltaUpdate.ItemId, out StringBuilder? arguments))
+            {
+                functionArgumentBuildersById[deltaUpdate.ItemId] = arguments = new();
+            }
+
+            if (!string.IsNullOrWhiteSpace(deltaUpdate.FunctionArguments))
+            {
+                arguments.Append(deltaUpdate.FunctionArguments);
+            }
+        }
+
+        private static async Task HandleItemStreamingFinished(
+            ConversationItemStreamingFinishedUpdate itemStreamingFinishedUpdate,
+            Kernel kernel,
+            RealtimeConversationSession session,
+            Dictionary<string, StringBuilder> functionArgumentBuildersById)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"  -- Item streaming finished, item_id={itemStreamingFinishedUpdate.ItemId}");
+
+            // If an item is a function call, invoke a function with provided arguments.
+            if (itemStreamingFinishedUpdate.FunctionCallId is not null)
+            {
+                await HandleFunctionCall(itemStreamingFinishedUpdate, kernel, session, functionArgumentBuildersById);
+            }
+            // If an item is a response message, output it to the console.
+            else if (itemStreamingFinishedUpdate.MessageContentParts?.Count > 0)
+            {
+                HandleResponseMessage(itemStreamingFinishedUpdate);
+            }
+        }
+
+        private static async Task HandleFunctionCall(
+            ConversationItemStreamingFinishedUpdate itemStreamingFinishedUpdate,
+            Kernel kernel,
+            RealtimeConversationSession session,
+            Dictionary<string, StringBuilder> functionArgumentBuildersById)
+        {
+            Console.WriteLine($"    + Responding to tool invoked by item: {itemStreamingFinishedUpdate.FunctionName}");
+
+            // Parse function name.
+            var (functionName, pluginName) = ParseFunctionName(itemStreamingFinishedUpdate.FunctionName);
+
+            // Deserialize arguments.
+            var argumentsString = functionArgumentBuildersById[itemStreamingFinishedUpdate.ItemId].ToString();
+            var arguments = DeserializeArguments(argumentsString);
+
+            // Create a function call content based on received data. 
+            var functionCallContent = new FunctionCallContent(
+                functionName: functionName,
+                pluginName: pluginName,
+                id: itemStreamingFinishedUpdate.FunctionCallId,
+                arguments: arguments);
+
+            // Invoke a function.
+            var resultContent = await functionCallContent.InvokeAsync(kernel);
+
+            // Create a function call output conversation item with function call result.
+            ConversationItem functionOutputItem = ConversationItem.CreateFunctionCallOutput(
+                callId: itemStreamingFinishedUpdate.FunctionCallId,
+                output: ProcessFunctionResult(resultContent.Result));
+
+            // Send function call output conversation item to the session.
+            await session.AddItemAsync(functionOutputItem);
+        }
+
+        private static void HandleResponseMessage(ConversationItemStreamingFinishedUpdate itemStreamingFinishedUpdate)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write("Assistant: ");
+            Console.ForegroundColor = ConsoleColor.White;
+
+            foreach (ConversationContentPart contentPart in itemStreamingFinishedUpdate.MessageContentParts)
+            {
+                Console.Write(contentPart.Text);
+                // If there's no text but there is audio transcript, use that
+                if (string.IsNullOrEmpty(contentPart.Text) && !string.IsNullOrEmpty(contentPart.AudioTranscript))
+                {
+                    Console.Write(contentPart.AudioTranscript);
+                }
+            }            Console.ResetColor();
+            Console.WriteLine();
+        }        private void HandleTranscriptionFinished(ConversationInputTranscriptionFinishedUpdate transcriptionCompletedUpdate)
+        {
+            // Enhanced deduplication to prevent multiple "User said:" messages from VAD triggering multiple times
+            string transcript = transcriptionCompletedUpdate.Transcript?.Trim() ?? "";
+            
+            // Skip empty or very short transcripts
+            if (string.IsNullOrWhiteSpace(transcript) || transcript.Length < 3)
+            {
+                _logger.LogDebug("Skipping empty or short transcript: '{Transcript}'", transcript);
+                return;
+            }
+            
+            lock (_transcriptionLock)
+            {
+                var now = DateTime.UtcNow;
+                
+                // Clean up old transcriptions outside the deduplication window
+                var keysToRemove = _recentTranscriptions
+                    .Where(kvp => now - kvp.Value > _transcriptionDeduplicationWindow)
+                    .Select(kvp => kvp.Key)
+                    .ToList();
+                
+                foreach (var key in keysToRemove)
+                {
+                    _recentTranscriptions.Remove(key);
+                }
+                
+                // Enhanced duplicate detection: check for exact matches and similar content
+                var normalizedTranscript = NormalizeTranscript(transcript);
+                
+                // Check for exact duplicates
+                if (_recentTranscriptions.ContainsKey(normalizedTranscript))
+                {
+                    _logger.LogDebug("Skipping exact duplicate transcription: '{Transcript}'", transcript);
+                    return;
+                }
+                
+                // Check for similar transcriptions within the same recording session
+                if (now - _lastRecordingStartTime <= _recordingSessionWindow)
+                {
+                    foreach (var existingTranscript in _recentTranscriptions.Keys.ToList())
+                    {
+                        if (AreSimilarTranscripts(normalizedTranscript, existingTranscript))
+                        {
+                            _logger.LogDebug("Skipping similar transcript within recording session: '{NewTranscript}' (similar to '{ExistingTranscript}')", 
+                                transcript, existingTranscript);
+                            return;
+                        }
+                    }
+                }
+                
+                // Add this transcript to recent transcriptions
+                _recentTranscriptions[normalizedTranscript] = now;
+            }
+            
+            // Display the unique transcription
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.Write("User said: ");
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.WriteLine(transcript);
+            Console.ResetColor();
+            Console.WriteLine();
+        }
+
+        /// <summary>
+        /// Normalizes transcript for better duplicate detection
+        /// </summary>
+        private string NormalizeTranscript(string transcript)
+        {
+            return transcript.ToLowerInvariant()
+                .Replace(".", "")
+                .Replace(",", "")
+                .Replace("!", "")
+                .Replace("?", "")
+                .Trim();
+        }
+
+        /// <summary>
+        /// Determines if two transcripts are similar enough to be considered duplicates
+        /// </summary>
+        private bool AreSimilarTranscripts(string transcript1, string transcript2)
+        {
+            // If one is contained in the other, they're similar
+            if (transcript1.Contains(transcript2) || transcript2.Contains(transcript1))
+            {
+                return true;
+            }
+            
+            // Calculate simple similarity based on word overlap
+            var words1 = transcript1.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var words2 = transcript2.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            
+            if (words1.Length == 0 || words2.Length == 0)
+                return false;
+            
+            var commonWords = words1.Intersect(words2).Count();
+            var totalWords = Math.Max(words1.Length, words2.Length);
+            
+            // If 80% or more words are common, consider them similar
+            return (double)commonWords / totalWords >= 0.8;
+        }private async Task HandleResponseFinished(
+            ConversationResponseFinishedUpdate turnFinishedUpdate,
+            RealtimeConversationSession session,
+            Dictionary<string, MemoryStream> outputAudioStreamsById)
+        {
+            Console.WriteLine($"  -- Model turn generation finished. Status: {turnFinishedUpdate.Status}");
+
+            // Mark response as completed to allow new responses
+            MarkResponseCompleted();
+
+            // If the created session items contain a function name, it indicates a function call result has been provided,
+            // and response updates can begin.
+            if (turnFinishedUpdate.CreatedItems.Any(item => item.FunctionName?.Length > 0))
+            {
+                Console.WriteLine("  -- Ending client turn for pending tool responses");
+                await SafeStartResponseAsync();
+            }
+            // Otherwise, the model's response is provided, signaling that updates can be stopped.
+            else
+            {
+                await ProcessAudioOutput(outputAudioStreamsById);
+            }
+        }
+
+        private async Task ProcessAudioOutput(Dictionary<string, MemoryStream> outputAudioStreamsById)
+        {
+            // Output the size of received audio data and dispose streams.
+            foreach ((string itemId, Stream outputAudioStream) in outputAudioStreamsById)
+            {
+                Console.WriteLine($"Raw audio output for {itemId}: {outputAudioStream.Length} bytes");
+                await ConvertAndPlayAudio(outputAudioStream);
+                outputAudioStreamsById.Remove(itemId);
+            }
+        }
+
+        private async Task ConvertAndPlayAudio(Stream outputAudioStream)
+        {
+            // Convert raw PCM data to WAV format
+            var wavHeader = CreateWavHeader((int)outputAudioStream.Length);
+
+            // Create a new memory stream for the WAV file
+            using var wavStream = new MemoryStream();
+            
+            // Write WAV header to output stream
+            await wavStream.WriteAsync(wavHeader);
+            
+            // Write audio data
+            outputAudioStream.Seek(0, SeekOrigin.Begin);
+            await outputAudioStream.CopyToAsync(wavStream);
+            
+            var outputAudioPath = $"outputaudio_{DateTime.Now:yyyyMMddHHmmss}.wav";
+            using (var fileStream = new FileStream(outputAudioPath, FileMode.Create, FileAccess.Write))
+            {
+                wavStream.Seek(0, SeekOrigin.Begin);
+                await wavStream.CopyToAsync(fileStream);
+                await fileStream.FlushAsync();
+            }
+
+            Console.WriteLine($"Output audio saved to {outputAudioPath}");
+            await PlayAudioFile(outputAudioPath);
+            
+            // Close and remove the audio stream from the dictionary before continuing
+            try
+            {
+                await outputAudioStream.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing audio stream");
+            }
+        }
+
+        private static byte[] CreateWavHeader(int audioDataLength)
+        {
+            var wavHeader = new byte[44];
+            int sampleRate = 22050;
+            short bitsPerSample = 16;
+            short channels = 1;
+            int byteRate = sampleRate * channels * (bitsPerSample / 8);
+            int blockAlign = channels * (bitsPerSample / 8);
+            int subChunk2Size = audioDataLength;
+            int chunkSize = 36 + subChunk2Size;
+
+            // RIFF header
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("RIFF"), 0, wavHeader, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(chunkSize), 0, wavHeader, 4, 4);
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("WAVE"), 0, wavHeader, 8, 4);
+
+            // fmt subchunk
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("fmt "), 0, wavHeader, 12, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(16), 0, wavHeader, 16, 4); // Subchunk1Size (16 for PCM)
+            Buffer.BlockCopy(BitConverter.GetBytes((short)1), 0, wavHeader, 20, 2); // AudioFormat (1 for PCM)
+            Buffer.BlockCopy(BitConverter.GetBytes(channels), 0, wavHeader, 22, 2); // NumChannels
+            Buffer.BlockCopy(BitConverter.GetBytes(sampleRate), 0, wavHeader, 24, 4); // SampleRate
+            Buffer.BlockCopy(BitConverter.GetBytes(byteRate), 0, wavHeader, 28, 4); // ByteRate
+            Buffer.BlockCopy(BitConverter.GetBytes(blockAlign), 0, wavHeader, 32, 2); // BlockAlign
+            Buffer.BlockCopy(BitConverter.GetBytes(bitsPerSample), 0, wavHeader, 34, 2); // BitsPerSample
+
+            // data subchunk
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("data"), 0, wavHeader, 36, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(subChunk2Size), 0, wavHeader, 40, 4);
+
+            return wavHeader;
+        }
+
+        private async Task PlayAudioFile(string outputAudioPath)
+        {
+            string playerCommand;
+            string playerArgs;
+
+            if (OperatingSystem.IsWindows())
+            {
+                playerCommand = "powershell";
+                playerArgs = $"-c (New-Object Media.SoundPlayer '{outputAudioPath}').PlaySync()";
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                playerCommand = "afplay";
+                playerArgs = $"\"{outputAudioPath}\"";
+            }
+            else // Linux
+            {
+                playerCommand = "aplay";
+                playerArgs = $"-q \"{outputAudioPath}\"";
+            }
+
+            var playProcess = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = playerCommand,
+                    Arguments = playerArgs,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Directory.GetCurrentDirectory()
+                }
+            };
+            
+            try
+            {
+                playProcess.Start();
+                await playProcess.WaitForExitAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error playing audio file {FilePath}", outputAudioPath);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error playing audio: {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        private static void HandleConversationError(ConversationErrorUpdate errorUpdate)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"ERROR: {errorUpdate.Message}");
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }        protected virtual void Dispose(bool disposing)
+        {
+            if (_disposed)
+                return;
+
+            if (disposing)
+            {
+                // Dispose managed resources
+                CleanupSession().GetAwaiter().GetResult();
+                _voiceHandler.Dispose();
+                _sessionLock.Dispose();
+                  // Clear transcription deduplication data
+                lock (_transcriptionLock)
+                {
+                    _recentTranscriptions.Clear();
+                    _lastRecordingStartTime = DateTime.MinValue;
+                }
+                
+                // Clear response state
+                lock (_responseLock)
+                {
+                    _responseInProgress = false;
+                }
+                
+                // Note: RealtimeConversationClient doesn't implement IDisposable
+            }
+
+            _disposed = true;
         }
     }
 }
