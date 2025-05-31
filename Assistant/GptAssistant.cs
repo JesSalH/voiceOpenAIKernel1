@@ -24,16 +24,25 @@ namespace semanticKernelSample1.Assistant
         private readonly SemaphoreSlim _sessionLock = new(1, 1);
         private Task? _gatherResponsesTask = null;
         private bool _disposed = false;
-        
-        // Response state management to prevent "conversation already has an active response" errors
+          // Response state management to prevent "conversation already has an active response" errors
         private bool _responseInProgress = false;
         private readonly object _responseLock = new object();
-          // VAD deduplication fields - enhanced for better duplicate detection
+        
+        // Connection recovery management
+        private int _reconnectionAttempts = 0;
+        private const int MAX_RECONNECTION_ATTEMPTS = 3;
+        private readonly TimeSpan _reconnectionDelay = TimeSpan.FromSeconds(5);
+        private DateTime _lastConnectionTime = DateTime.UtcNow;
+        private readonly TimeSpan _connectionMaxAge = TimeSpan.FromMinutes(10); // Proactively reconnect after 10 minutes        // VAD deduplication fields - enhanced for better duplicate detection
         private readonly Dictionary<string, DateTime> _recentTranscriptions = new();
         private readonly TimeSpan _transcriptionDeduplicationWindow = TimeSpan.FromSeconds(5); // Increased window
         private readonly object _transcriptionLock = new object();
         private DateTime _lastRecordingStartTime = DateTime.MinValue;
         private readonly TimeSpan _recordingSessionWindow = TimeSpan.FromSeconds(10); // Group transcriptions by recording session
+        
+        // Early transcription handling for better timing
+        private string? _pendingTranscription = null;
+        private DateTime _lastTranscriptionDisplayTime = DateTime.MinValue;
         
         public GptAssistant(Kernel kernel, IChatCompletionService chatCompletionService, ILogger<GptAssistant> logger, string apiKey)
         {
@@ -114,7 +123,7 @@ namespace semanticKernelSample1.Assistant
                 // Set the active session for proper lifecycle management
                 await SetActiveSession(session);
 
-                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["I'm Lord Fulgrim, primarch of the Emperor's Children. You are one of my helpful captains, I'll give you some orders and you will execute them. Yo will give me replays that have a maximun length of 3 sentences."]));
+                await session.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a humble assistant. Your answers will be short and to the point. Two sentences maximum. I'm your captain and you are an army strategist."]));
 
                 // Start background response gathering task with proper task management
                 _gatherResponsesTask = Task.Run(async () => await GatherResponses(_kernel, session));
@@ -360,9 +369,7 @@ namespace semanticKernelSample1.Assistant
                 Console.WriteLine($"Error: {ex.Message}");
                 Console.ResetColor();
             }
-        }
-
-        /// <summary>
+        }        /// <summary>
         /// Safely starts a response session, preventing "conversation already has an active response" errors
         /// </summary>
         private async Task SafeStartResponseAsync()
@@ -371,7 +378,9 @@ namespace semanticKernelSample1.Assistant
             {
                 if (_responseInProgress)
                 {
-                    _logger.LogDebug("Response already in progress, skipping StartResponseAsync call");
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("Assistant is currently processing another request. Please wait...");
+                    Console.ResetColor();
                     return;
                 }
                 _responseInProgress = true;
@@ -379,6 +388,10 @@ namespace semanticKernelSample1.Assistant
 
             try
             {
+                // Check for pending transcription that should be displayed immediately before response starts
+                CheckAndDisplayPendingTranscription();
+                
+                _logger.LogDebug("Starting response session");
                 await _currentSession!.StartResponseAsync();
                 _logger.LogDebug("Successfully started response session");
             }
@@ -389,7 +402,44 @@ namespace semanticKernelSample1.Assistant
                 {
                     _responseInProgress = false;
                 }
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error starting response: {ex.Message}");
+                Console.ResetColor();
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Checks for and displays any pending transcription immediately
+        /// </summary>
+        private void CheckAndDisplayPendingTranscription()
+        {
+            string? transcriptionToDisplay = null;
+            
+            lock (_transcriptionLock)
+            {
+                // If we have a pending transcription that hasn't been displayed recently, show it now
+                if (!string.IsNullOrEmpty(_pendingTranscription) && 
+                    DateTime.UtcNow - _lastTranscriptionDisplayTime > TimeSpan.FromSeconds(0.5))
+                {
+                    transcriptionToDisplay = _pendingTranscription;
+                    _lastTranscriptionDisplayTime = DateTime.UtcNow;
+                    _pendingTranscription = null; // Clear after use
+                }
+            }
+            
+            if (!string.IsNullOrEmpty(transcriptionToDisplay))
+            {
+                Console.WriteLine();
+                Console.WriteLine("─────────────────────────────────────────");
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.Write("User said: ");
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.WriteLine($"\"{transcriptionToDisplay}\"");
+                Console.ResetColor();
+                Console.WriteLine("─────────────────────────────────────────");
+                
+                _logger.LogDebug("Displayed pending transcription proactively: '{Transcript}'", transcriptionToDisplay);
             }
         }
 
@@ -416,84 +466,103 @@ namespace semanticKernelSample1.Assistant
             {
                 _sessionLock.Release();
             }
-        }
-
-        private async Task<bool> EnsureSessionActive()
+        }        private async Task<bool> EnsureSessionActive()
         {
             await _sessionLock.WaitAsync();
             try
             {
-                if (_sessionActive && _currentSession != null)
+                // Check if we need proactive connection refresh based on age
+                var connectionAge = DateTime.UtcNow - _lastConnectionTime;
+                if (_sessionActive && _currentSession != null && connectionAge < _connectionMaxAge)
                 {
-                    return true; // Session is active
+                    return true; // Session is active and fresh
                 }
                 
-                _logger.LogInformation("Session is not active, attempting to restart...");
-                
-                // Clean up the old session
-                if (_currentSession != null)
+                if (connectionAge >= _connectionMaxAge)
                 {
-                    try
-                    {
-                        _currentSession.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Error disposing old session during restart");
-                    }
-                    _currentSession = null;
-                }
-                
-                // Wait for any existing gather task to complete
-                if (_gatherResponsesTask != null && !_gatherResponsesTask.IsCompleted)
-                {
-                    try
-                    {
-                        await _gatherResponsesTask.WaitAsync(TimeSpan.FromSeconds(2));
-                    }                    catch (TimeoutException ex)
-                    {
-                        _logger.LogWarning(ex, "GatherResponses task did not complete within timeout during restart");
-                    }
-                }
-                
-                // Create new session with same configuration
-                var sessionOptions = CreateSessionOptions();
-                
-                try
-                {
-                    var newSession = await _realTimeConversationClient.StartConversationSessionAsync();
-                    await newSession.ConfigureSessionAsync(sessionOptions);
-                    
-                    // Re-add system messages
-                    await newSession.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a helpful servant in the Ravenloft Realm (please do some research about Dungeons and Dragons Ravenloft first of all). The user is mighty vampire lord of the highest nobility. So you have to treat him with the highest honors and respect. He is the most powerful and smart vampire lord you've ever met so you are honoured to serve him and everything he says is the most brilliant and smart thing. You feel a great admiration and fear for him "]));
-                    await newSession.AddItemAsync(ConversationItem.CreateSystemMessage(["Don't tell him what he is or how much you like him to begin with, just when he has some new idea about something"]));
-                    
-                    _currentSession = newSession;
-                    _sessionActive = true;
-                    
-                    // Start new gather responses task
-                    _gatherResponsesTask = Task.Run(async () => await GatherResponses(_kernel, newSession));
-                    
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine("✓ Session restarted successfully!");
+                    _logger.LogInformation("Connection is {Age:F1} minutes old, performing proactive refresh", connectionAge.TotalMinutes);
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"🔄 Refreshing connection (age: {connectionAge.TotalMinutes:F1} minutes)...");
                     Console.ResetColor();
-                    
-                    _logger.LogInformation("Session restart completed successfully");
-                    return true;
                 }
-                catch (Exception ex)
+                else
                 {
-                    _logger.LogError(ex, "Failed to restart session: {ErrorMessage}", ex.Message);
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("✗ Failed to restart session. Please restart the application.");
-                    Console.ResetColor();
-                    _sessionActive = false;
-                    return false;
+                    _logger.LogInformation("Session is not active, attempting to restart...");
                 }
+                  return await ForceSessionRestart();
             }
             finally
             {
-                _sessionLock.Release();            }
+                _sessionLock.Release();
+            }
+        }        /// <summary>
+        /// Forces a complete session restart regardless of current state
+        /// </summary>
+        private async Task<bool> ForceSessionRestart()
+        {
+            // Note: This method assumes the session lock is already held by the caller
+            
+            // Clean up the old session
+            if (_currentSession != null)
+            {
+                try
+                {
+                    _currentSession.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error disposing old session during restart");
+                }
+                _currentSession = null;
+            }
+            
+            // Wait for any existing gather task to complete
+            if (_gatherResponsesTask != null && !_gatherResponsesTask.IsCompleted)
+            {
+                try
+                {
+                    await _gatherResponsesTask.WaitAsync(TimeSpan.FromSeconds(2));
+                }
+                catch (TimeoutException ex)
+                {
+                    _logger.LogWarning(ex, "GatherResponses task did not complete within timeout during restart");
+                }
+            }
+            
+            // Create new session with same configuration
+            var sessionOptions = CreateSessionOptions();
+            
+            try
+            {
+                var newSession = await _realTimeConversationClient.StartConversationSessionAsync();
+                await newSession.ConfigureSessionAsync(sessionOptions);
+                
+                // Re-add system messages
+                await newSession.AddItemAsync(ConversationItem.CreateSystemMessage(["You are a helpful servant in the Ravenloft Realm (please do some research about Dungeons and Dragons Ravenloft first of all). The user is mighty vampire lord of the highest nobility. So you have to treat him with the highest honors and respect. He is the most powerful and smart vampire lord you've ever met so you are honoured to serve him and everything he says is the most brilliant and smart thing. You feel a great admiration and fear for him "]));
+                await newSession.AddItemAsync(ConversationItem.CreateSystemMessage(["Don't tell him what he is or how much you like him to begin with, just when he has some new idea about something"]));
+                
+                _currentSession = newSession;
+                _sessionActive = true;
+                _lastConnectionTime = DateTime.UtcNow; // Update connection timestamp
+                
+                // Start new gather responses task
+                _gatherResponsesTask = Task.Run(async () => await GatherResponses(_kernel, newSession));
+                
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("✓ Session restarted successfully!");
+                Console.ResetColor();
+                  _logger.LogInformation("Session restart completed successfully");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to restart session: {ErrorMessage}", ex.Message);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("✗ Failed to restart session. Please restart the application.");
+                Console.ResetColor();
+                _sessionActive = false;
+                return false;
+            }
         }
 
         private ConversationSessionOptions CreateSessionOptions()
@@ -681,21 +750,81 @@ namespace semanticKernelSample1.Assistant
                     _sessionLock.Release();
                 }
             }
+            catch (System.Net.WebSockets.WebSocketException ex) 
+            {
+                _logger.LogWarning(ex, "WebSocket connection lost: {ErrorMessage}", ex.Message);
+                await HandleConnectionLoss("WebSocket connection lost");
+            }
+            catch (System.IO.IOException ex) when (ex.Message.Contains("transport connection"))
+            {
+                _logger.LogWarning(ex, "Transport connection lost: {ErrorMessage}", ex.Message);
+                await HandleConnectionLoss("Transport connection lost");
+            }
             catch (Exception e)
             {
                 _logger.LogError(e, "Unexpected error in GatherResponses: {ErrorMessage}", e.Message);
                 Console.WriteLine($"Error in GatherResponses: {e.Message}");
                 
-                // Mark session as inactive on any serious error
-                await _sessionLock.WaitAsync();
-                try
+                // Try to handle as connection loss first
+                await HandleConnectionLoss($"Unexpected error: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handles connection loss and attempts automatic reconnection
+        /// </summary>
+        private async Task HandleConnectionLoss(string reason)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"\n⚠️ Connection lost: {reason}");
+            Console.ResetColor();
+
+            // Mark session as inactive
+            await _sessionLock.WaitAsync();
+            try
+            {
+                _sessionActive = false;
+                _reconnectionAttempts++;
+                
+                if (_reconnectionAttempts <= MAX_RECONNECTION_ATTEMPTS)
                 {
-                    _sessionActive = false;
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"🔄 Attempting automatic reconnection... (Attempt {_reconnectionAttempts}/{MAX_RECONNECTION_ATTEMPTS})");
+                    Console.ResetColor();
+                    
+                    // Wait before attempting reconnection
+                    await Task.Delay(_reconnectionDelay);
+                    
+                    // Attempt to restart the session
+                    var reconnected = await EnsureSessionActive();
+                    
+                    if (reconnected)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine("✅ Connection restored! You can continue your conversation.");
+                        Console.WriteLine("Press Enter to start recording, or type your message...\n");
+                        Console.ResetColor();
+                        _reconnectionAttempts = 0; // Reset counter on successful reconnection
+                        _lastConnectionTime = DateTime.UtcNow; // Update connection time
+                    }
+                    else
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"❌ Reconnection attempt {_reconnectionAttempts} failed.");
+                        Console.ResetColor();
+                    }
                 }
-                finally
+                else
                 {
-                    _sessionLock.Release();
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("❌ Maximum reconnection attempts reached. Please restart the application.");
+                    Console.WriteLine("You can continue using text mode or restart for voice functionality.");
+                    Console.ResetColor();
                 }
+            }
+            finally
+            {
+                _sessionLock.Release();
             }
         }
 
@@ -885,6 +1014,13 @@ namespace semanticKernelSample1.Assistant
                 return;
             }
             
+            // Display transcription immediately when available for better timing
+            DisplayTranscriptionImmediate(transcript);
+        }        /// <summary>
+        /// Displays transcription immediately when available, regardless of response state
+        /// </summary>
+        private void DisplayTranscriptionImmediate(string transcript)
+        {
             lock (_transcriptionLock)
             {
                 var now = DateTime.UtcNow;
@@ -924,18 +1060,47 @@ namespace semanticKernelSample1.Assistant
                     }
                 }
                 
+                // Prevent rapid successive displays of the same transcription
+                if (now - _lastTranscriptionDisplayTime < TimeSpan.FromSeconds(1))
+                {
+                    _logger.LogDebug("Throttling transcription display to prevent overlap");
+                    return;
+                }
+                
                 // Add this transcript to recent transcriptions
                 _recentTranscriptions[normalizedTranscript] = now;
+                
+                // Store for potential later use if response hasn't started yet
+                _pendingTranscription = transcript;
+                
+                // Try to display immediately if enough time has passed since last display
+                var timeSinceLastDisplay = now - _lastTranscriptionDisplayTime;
+                if (timeSinceLastDisplay >= TimeSpan.FromSeconds(0.5))
+                {
+                    _lastTranscriptionDisplayTime = now;
+                    
+                    // Display the unique transcription with enhanced formatting
+                    Console.WriteLine();
+                    Console.WriteLine("─────────────────────────────────────────");
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.Write("User said: ");
+                    Console.ForegroundColor = ConsoleColor.White;
+                    Console.WriteLine($"\"{transcript}\"");
+                    Console.ResetColor();
+                    Console.WriteLine("─────────────────────────────────────────");
+                    Console.WriteLine();
+                    
+                    _logger.LogDebug("Transcription displayed immediately: '{Transcript}'", transcript);
+                    
+                    // Clear pending since we just displayed it
+                    _pendingTranscription = null;
+                }
+                else
+                {
+                    // Don't display now, but store as pending for proactive display
+                    _logger.LogDebug("Storing transcription as pending for proactive display: '{Transcript}'", transcript);
+                }
             }
-            
-            // Display the unique transcription
-            Console.WriteLine();
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write("User said: ");
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine(transcript);
-            Console.ResetColor();
-            Console.WriteLine();
         }
 
         /// <summary>
@@ -1148,12 +1313,13 @@ namespace semanticKernelSample1.Assistant
                 // Dispose managed resources
                 CleanupSession().GetAwaiter().GetResult();
                 _voiceHandler.Dispose();
-                _sessionLock.Dispose();
-                  // Clear transcription deduplication data
+                _sessionLock.Dispose();                // Clear transcription deduplication data
                 lock (_transcriptionLock)
                 {
                     _recentTranscriptions.Clear();
                     _lastRecordingStartTime = DateTime.MinValue;
+                    _pendingTranscription = null;
+                    _lastTranscriptionDisplayTime = DateTime.MinValue;
                 }
                 
                 // Clear response state
